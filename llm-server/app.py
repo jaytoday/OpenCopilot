@@ -1,74 +1,90 @@
-import json
-
-import requests
+import asyncio
+from dotenv import load_dotenv
 from flask import Flask, request
-from langchain.chains.openai_functions import create_structured_output_chain
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
-from langchain.utilities.openapi import OpenAPISpec
+from flask import jsonify
+from utils.vector_store_setup import init_qdrant_collections
 
-from api_caller.base import try_to_match_and_call_api_endpoint
-from models.models import AiResponseFormat
-from prompts.base import non_api_base_prompt, api_base_prompt
+from routes.action.action_controller import action
+from routes.chat.chat_controller import chat_workflow, send_chat_stream
+from routes.copilot.copilot_controller import copilot
+from routes.data_source.data_source_controller import datasource_workflow
+from routes.flow.flow_controller import flow
+from routes.prompt.prompt_controller import prompt_workflow
+from routes.prompt.prompt_template_controller import prompt_template_workflow
+from routes.uploads.upload_controller import upload_controller
+from shared.models.opencopilot_db import create_database_schema
+from utils.config import Config
+from utils.db import NoSQLDatabase
+from routes.chat.chat_dto import ChatInput
+
+from flask_socketio import SocketIO
+from utils.get_logger import CustomLogger
+
+logger = CustomLogger(__name__)
+
+db_instance = NoSQLDatabase()
+mongo = db_instance.get_db()
+
+load_dotenv()
+
+create_database_schema()
 
 app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+app.url_map.strict_slashes = False
+app.register_blueprint(flow, url_prefix="/backend/flows")
+app.register_blueprint(chat_workflow, url_prefix="/backend/chat")
+app.register_blueprint(copilot, url_prefix="/backend/copilot")
+app.register_blueprint(upload_controller, url_prefix="/backend/uploads")
+app.register_blueprint(datasource_workflow, url_prefix="/backend/data_sources")
+app.register_blueprint(prompt_template_workflow, url_prefix="/backend/prompt-templates")
+app.register_blueprint(prompt_workflow, url_prefix="/backend/prompts")
+app.register_blueprint(action, url_prefix="/backend/actions")
+
+app.config.from_object(Config)
+
+@app.errorhandler(Exception)
+def internal_server_error(error):
+    # Log the error or perform any other necessary actions
+    logger.error(f"Internal Server Error: {str(error)}")
+    return jsonify({'error': 'Internal Server Error', 'message': 'An unexpected error occurred on the server.'}), 500
+
+@app.route("/healthcheck")
+def health_check():
+    info = mongo.client
+    return jsonify(
+        status="OK", servers={"mongo": info.options.pool_options.max_pool_size}
+    )
 
 
-## TODO: Implement caching for the swagger file content (no need to load it everytime)
-@app.route('/handle', methods=['POST', 'OPTIONS'])
-def handle():
-    data = request.get_json()
-    text = data.get('text')
-    swagger_url = data.get('swagger_url')
-    base_prompt = data.get('base_prompt')
-    headers = data.get('headers', {})
+@socketio.on("send_chat")
+def handle_send_chat(json_data):
+    input_data = ChatInput(**json_data)
+    message = input_data.content
+    session_id = input_data.session_id
+    headers_from_json = input_data.headers
 
-    if not text:
-        return json.dumps({"error": "text is required"}), 400
+    headers = request.headers
 
-    if not swagger_url:
-        return json.dumps({"error": "swagger_url is required"}), 400
+    bot_token = headers.environ.get("HTTP_X_BOT_TOKEN")
 
-    if not base_prompt:
-        return json.dumps({"error": "base_prompt is required"}), 400
+    if not message or len(message) > 255:
+        socketio.emit(
+            session_id, {"error": "Invalid content, the size is larger than 255 char"}
+        )
+        return
 
-    if swagger_url.startswith("https://"):
-        full_url = swagger_url
-        response = requests.get(full_url)
-        if response.status_code == 200:
-            swagger_text = response.text
-        else:
-            return json.dumps({"error": "Failed to fetch Swagger content"}), 500
-    else:
-        full_url = "/app/shared_data/" + swagger_url
-        try:
-            with open(full_url, 'r') as file:
-                swagger_text = file.read()
-        except FileNotFoundError:
-            return json.dumps({"error": "File not found"}), 404
+    if not bot_token:
+        socketio.emit(session_id, {"error": "Bot token is required"})
+        return
 
-    swagger_spec = OpenAPISpec.from_text(swagger_text)
-
-    try:
-        json_output = try_to_match_and_call_api_endpoint(swagger_spec, text, headers)
-    except Exception as e:
-        warnings.warn(str(e))
-        json_output = None
-
-    llm = ChatOpenAI(model="gpt-3.5-turbo-0613", temperature=0)
-
-    if json_output is None:
-        prompt_msgs = non_api_base_prompt(base_prompt, text)
-
-    else:
-        prompt_msgs = api_base_prompt(base_prompt, text, json_output)
-
-    prompt = ChatPromptTemplate(messages=prompt_msgs)
-    chain = create_structured_output_chain(AiResponseFormat, llm, prompt, verbose=False)
-    chain_output = chain.run(question=text)
-
-    return json.loads(json.dumps(chain_output.dict())), 200
+    asyncio.run(send_chat_stream(message, bot_token, session_id, headers_from_json))
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8002)
+init_qdrant_collections()
+
+if __name__ == "__main__":
+    socketio.run(
+        app, host="0.0.0.0", port=8002, debug=True, use_reloader=True, log_output=False
+    )

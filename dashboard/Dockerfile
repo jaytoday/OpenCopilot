@@ -1,36 +1,60 @@
-# Use an official PHP runtime as the base image
-FROM php:8.1-cli
+# Start with a base node image
+FROM node:18-alpine AS base
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+# Install corepack and pnpm
+RUN corepack enable
+RUN corepack prepare pnpm@8.7.0 --activate
+FROM base AS deps
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    libpq-dev \
-    libzip-dev \
-    zip \
-    unzip \
-    git
+# Add libc6-compat if necessary for your application
+RUN apk add --no-cache libc6-compat
 
-RUN docker-php-ext-install pdo pdo_mysql
+WORKDIR /app
 
-# Set the working directory
-WORKDIR /var/www/html
+# Copy package files
+COPY package.json pnpm-lock.yaml* ./
 
-# Copy the project files to the container
+# Install dependencies
+# This layer will be cached unless package.json or pnpm-lock.yaml changes
+RUN pnpm i --frozen-lockfile
+
+# Builder image
+FROM base AS builder
+
+WORKDIR /app
+
+# Copy installed node_modules from deps stage
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy the rest of your application's source code
 COPY . .
 
-# Copy the .env file (assuming it's in the same directory as the Dockerfile)
-COPY .env.example .env
+# Build your application
+RUN pnpm run build
 
-# Install Composer
-RUN curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+# Production image
+FROM base AS runner
 
-# Install Composer dependencies
-RUN composer install --no-plugins --no-scripts
+# Set environment variables
+ENV NODE_ENV production
+ENV NEXT_TELEMETRY_DISABLED 1
+ENV PORT 8000
+ENV HOSTNAME "0.0.0.0"
 
-# Generate the Laravel application key
-RUN php artisan key:generate
+WORKDIR /app
 
-# Expose the container's port 8000 (default for `php artisan serve`)
+# Create a non-root user
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+# Copy the build output and necessary files from builder stage
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+# copy public folder
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+USER nextjs
+
 EXPOSE 8000
 
-# Start the Laravel development server
-CMD php artisan serve --host=0.0.0.0 --port=8000
+CMD ["node", "server.js"]
